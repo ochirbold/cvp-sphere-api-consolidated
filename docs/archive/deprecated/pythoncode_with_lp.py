@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""
+pythoncode.py - CVP Formula Execution Engine with LP Optimization
+
+This module provides database-driven formula execution for CVP analysis.
+It supports three modes:
+1. Indicator ID mode: Get formulas and table from database
+2. Manual mode: Specify table and formulas manually
+3. Legacy mode: Backward compatibility with manual mapping
+
+New feature: LP Optimization Extension
+- Detects LP formulas in scenario context
+- Builds LP matrices from formulas
+- Solves LP problems using scipy.optimize.linprog
+- Integrates results back into scenario context
+
+Refactored version with improvements:
+- PEP8 compliance
+- Better error handling
+- Improved logging
+- Cleaner code structure
+- LP optimization support
+"""
+
+import sys
+import oracledb
+from collections import defaultdict
+from dotenv import load_dotenv
+import os
+from typing import Dict, List, Tuple, Optional, Any, Set
+
+# Import from the updated formula_runtime
+from formula_runtime import run_formula, extract_identifiers, detect_scenario_functions
+
+# Import LP optimization modules
+try:
+    from lp_model_parser import LPModelParser, detect_lp_components
+    from lp_matrix_builder import LPMatrixBuilder, build_cvp_matrices
+    from lp_solver import LPSolver, solve_lp_from_matrices
+    LP_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARNING] LP optimization modules not available: {e}")
+    print("[WARNING] LP optimization will be disabled")
+    LP_AVAILABLE = False
+
+
+# ============================================================================
+# ENVIRONMENT AND CONFIGURATION
+# ============================================================================
+
+# Load environment variables from .env file
+load_dotenv()
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def q(name: str) -> str:
+    """Quote SQL identifier with double quotes for Oracle."""
+    parts = name.split(".")
+    return ".".join(f'"{p}"' for p in parts)
+
+
+def parse_column_mapping(mapping_str: str) -> Dict[str, str]:
+    """
+    Parse column mapping string.
+    
+    Supported formats:
+    1. '"A":A "B":B "C":C' -> {'A':'A','B':'B','C':'C'}
+    2. 'A:A B:B C:C' -> {'A':'A','B':'B','C':'C'}
+    3. '"Column Name":"COLUMN_NAME" "Another":"ANOTHER"' -> 
+       {'Column Name':'COLUMN_NAME','Another':'ANOTHER'}
+    """
+    mapping = {}
+    mapping_str = mapping_str.strip()
+    
+    # Remove surrounding quotes if present
+    if mapping_str.startswith('"') and mapping_str.endswith('"'):
+        mapping_str = mapping_str[1:-1]
+    
+    # Split by spaces, handling quoted column names with spaces
+    parts = []
+    current = ""
+    in_quotes = False
+    
+    for char in mapping_str:
+        if char == '"':
+            in_quotes = not in_quotes
+            current += char
+        elif char == ' ' and not in_quotes:
+            if current:
+                parts.append(current)
+                current = ""
+        else:
+            current += char
+    
+    if current:
+        parts.append(current)
+    
+    # Parse each part
+    for part in parts:
+        if ':' not in part:
+            raise ValueError(f"Invalid mapping part '{part}': missing ':'")
+        
+        # Handle quoted display names
+        if part.startswith('"'):
+            # Find the closing quote
+            quote_end = part.find('"', 1)
+            if quote_end == -1:
+                raise ValueError(f"Invalid mapping part '{part}': unmatched quote")
+            display_name = part[1:quote_end]
+            column_name = part[quote_end + 2:]  # Skip ':" after quote
+        else:
+            # Simple format without quotes
+            display_name, column_name = part.split(':', 1)
+        
+        mapping[display_name.strip()] = column_name.strip()
+    
+    return mapping
+
+
+def split_formula(formula: str) -> Tuple[str, str]:
+    """Split formula string into target and expression."""
+    if ":" not in formula:
+        raise ValueError(f"Formula must be TARGET:EXPR, got: {formula}")
+    
+    target, expr = formula.split(":", 1)
+    target = target.strip()
+    expr = expr.strip()
+    
+    if not target:
+        raise ValueError(f"Empty target in formula: {formula}")
+    if not expr:
+        raise ValueError(f"Empty expression in formula: {formula}")
+    
+    return target, expr
+
+
+def topo_sort(graph: Dict[str, Set[str]]) -> List[str]:
+    """Perform topological sort on dependency graph."""
+    graph = {k: set(v) for k, v in graph.items()}
+    order = []
+    
+    while graph:
+        ready = [k for k, v in graph.items() if not v]
+        if not ready:
+            raise ValueError("Cyclic dependency detected")
+        
+        for r in ready:
+            order.append(r)
+            del graph[r]
+            for deps in graph.values():
+                deps.discard(r)
+    
+    return order
+
+
+def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize row data by converting string numbers to int/float.
+    
+    Oracle VIEW-оос string болж ирсэн numeric утгуудыг
+    Python int / float болгон хувиргана.
+    """
+    normalized = row.copy()
+    
+    for key, value in normalized.items():
+        if isinstance(value, str):
+            try:
+                # Check if it contains decimal point
+                if "." in value:
+                    normalized[key] = float(value)
+                else:
+                    normalized[key] = int(value)
+            except ValueError:
+                pass  # Leave non-numeric strings as-is
+    
+    return normalized
+
+
+# ============================================================================
+# DATABASE OPERATIONS
+# ============================================================================
+
+def get_db_connection() -> oracledb.Connection:
+    """Get database connection using environment variables."""
+    db_user = os.environ.get("DB_USER")
+    db_password = os.environ.get("DB_PASSWORD")
+    db_host = os.environ.get("DB_HOST", "172.169.88.80")
+    db_port = int(os.environ.get("DB_PORT", "1521"))
+    db_sid = os.environ.get("DB_SID", "DEV")
+    
+    if not db_user or not db_password:
+        raise ValueError("Database credentials not found in environment variables")
+    
+    print(f"[INFO] Connecting to Oracle DB: {db_host}:{db_port}/{db_sid}")
+    
+    return oracledb.connect(
+        user=db_user,
+        password=db_password,
+        host=db_host,
+        port=db_port,
+        sid=db_sid
+    )
+
+
+def get_formulas_from_db(indicator_id: int) -> Tuple[str, Dict[str, str]]:
+    """Get formulas from database for given indicator_id."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Get table name from kpi_indicator
+        cur.execute(
+            "SELECT TABLE_NAME FROM kpi_indicator WHERE id = :id",
+            {"id": indicator_id}
+        )
+        table_result = cur.fetchone()
+        
+        if not table_result:
+            raise ValueError(f"Indicator with id {indicator_id} not found in kpi_indicator")
+        
+        table_name = table_result[0]
+        
+        # Get formulas from kpi_indicator_indicator_map
+        cur.execute(
+            "SELECT expression_string, column_name FROM kpi_indicator_indicator_map "
+            "WHERE main_indicator_id = :id AND EXPRESSION_STRING IS NOT NULL",
+            {"id": indicator_id}
+        )
+        formulas_result = cur.fetchall()
+        
+        # Convert to formulas dict: column_name -> expression_string
+        formulas = {}
+        for expr, col in formulas_result:
+            if expr and col:
+                formulas[col] = expr
+        
+        return table_name, formulas
+        
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ============================================================================
+# FORMULA ANALYSIS
+# ============================================================================
+
+def generate_auto_mapping(formulas: Dict[str, str]) -> Dict[str, str]:
+    """Generate column mapping automatically from formulas."""
+    all_identifiers = set()
+    
+    # Extract all identifiers from all formulas
+    for expr in formulas.values():
+        all_identifiers |= extract_identifiers(expr)
+    
+    # Also include all formula targets (output columns)
+    all_identifiers |= set(formulas.keys())
+    
+    # Filter out function names (NORM, DOT, SUM, AVG, COUNT, etc.)
+    function_names = {
+        'NORM', 'DOT', 'SUM', 'AVG', 'COUNT', 'COLUMN_SUM',
+        'AGG_MIN', 'AGG_SUM', 'AGG_MAX', 'pow', 'sqrt', 'abs',
+        'min', 'max', 'linprog'
+    }
+    
+    # Only keep identifiers that are not function names
+    column_identifiers = all_identifiers - function_names
+    
+    # Create mapping: identifier -> identifier (same name)
+    return {ident: ident for ident in sorted(column_identifiers)}
+
+
+def execute_lp_optimization(
+    scenario_context: Dict[str, Any],
+    formulas: Dict[str, str]
+) -> Dict[str, Any]:
+    """
+    Execute LP optimization if LP formulas are detected.
+    
+    Args:
+        scenario_context: Current scenario context with vector data
+        formulas: All formulas in the scenario
+        
+    Returns:
+        Updated scenario context with LP optimization results
+    """
+    if not LP_AVAILABLE:
+        print("[INFO] LP optimization modules not available, skipping LP optimization")
+        return scenario_context
+    
+    try:
+        # Detect LP components in formulas
+        parser = LPModelParser()
+        lp_spec = parser.detect_lp_formulas(formulas)
+        
+        if not lp_spec['is_lp_problem']:
+            print("[INFO] No LP problem detected in formulas")
+            return scenario_context
+        
+        print(f"[LP OPTIMIZATION] LP problem detected with variables: {lp_spec['variables']}")
+        print(f"[LP OPTIMIZATION] Objective: {lp_spec['objective']}")
+        print(f"[LP OPTIMIZATION] Constraints: {lp_spec['constraints']}")
+        print(f"[LP OPTIMIZATION] Bounds: {lp_spec['bounds']}")
+        
+        # Build LP matrices
+        builder = LPMatrixBuilder(scenario_context)
+        lp_matrices = builder.build_from_formulas(formulas, lp_spec)
+        
+        print(f"[LP OPTIMIZATION] Built LP matrices:")
+        print(f"  Variables: {lp_matrices['variables']}")
+        print(f"  c vector: {lp_matrices['c']}")
+        print(f"  A_ub shape: {len(lp_matrices['A_ub'])}x{len(lp_matrices['A_ub'][0]) if lp_matrices['A_ub'] else 0}")
+        print(f"  b_ub length: {len(lp_matrices['b_ub'])}")
+        
+        # Solve LP problem
+        solver = LPSolver()
+        result = solver.solve_from_matrices(lp_matrices, maximize=True)
+        
+        print(f"[LP OPTIMIZATION] LP solution:")
+        print(f"  Success: {result['success']}")
+        print(f"  Message: {result['message']}")
+        
+        if result['success']:
+            # Add LP solution to scenario context
+            for i, var_name in enumerate(lp_matrices['variables']):
+                scenario_context[var_name] = result['x'][i]
+                print(f"  {var_name} = {result['x'][i]}")
+            
+            # Add objective value
+            if lp_spec['objective']:
+                scenario_context[lp_spec['objective']] = result['fun']
+                print(f"  Objective value = {result['fun']}")
+            
+            # Add solver information
+            scenario_context['_lp_solution'] = result
+            print(f"[LP OPTIMIZATION] LP optimization completed successfully")
+        else:
+            print(f"[LP OPTIMIZATION] LP optimization failed: {result['message']}")
+            # Add error information to context
+            scenario_context['_lp_error'] = result
+        
+        return scenario_context
+        
+    except Exception as e:
+        print(f"[ERROR] LP optimization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return original context without LP results
+        return scenario_context
+
+
+def classify_and_execute_formulas(
+    formulas: Dict[str, str],
+    all_rows: List[Dict[str, Any]],
+    row_ids: List[Any]
+) -> Tuple[List[Dict[str, Any]], List[Tuple[Any, str, str]]]:
+    """
+    Classify formulas and execute them in appropriate order.
+    
+    Returns:
+        Tuple of (computed_rows, errors)
+    """
+    # Identify all input variables
+    all_input_vars = set()
+    for expr in formulas.values():
+        all_input_vars |= extract_identifiers(expr)
+    all_input_vars -= set(formulas.keys())
+    
+    # CVP-specific: F (fixed cost) is a scalar input
+    SCALAR_INPUTS = {'F'}
+    
+    # Step 1: Direct scenario seeds (formulas with DOT/NORM)
+    direct_scenario = set()
+    for target, expr in formulas.items():
+        if detect_scenario_functions(expr):
+            direct_scenario.add(target)
+    
+    # Step 2: Build dependency graph
+    dep_graph = {}
+    for target, expr in formulas.items():
+        deps = extract_identifiers(expr)
+        dep_graph[target] = {d for d in deps if d in formulas}
+    
+    # Step 3: Helper function
+    def references_row_level(target: str) -> bool:
+        expr = formulas[target]
+        deps = extract_identifiers(expr)
+        row_refs = deps & all_input_vars
+        row_refs -= SCALAR_INPUTS
+        return len(row_refs) > 0
+    
+    # Step 4: Identify ALL scenario formulas
+    scenario_targets = set(direct_scenario)
+    
+    changed = True
+    while changed:
+        changed = False
+        for target in list(formulas.keys()):
+            if target in scenario_targets:
+                continue
+            
+            deps = dep_graph[target]
+            if not deps:
+                continue
+            
+            if all(dep in scenario_targets for dep in deps):
+                if not references_row_level(target):
+                    scenario_targets.add(target)
+                    changed = True
+    
+    # Step 5: Final classification
+    scenario_formulas = {}
+    row_formulas = {}
+    
+    for target, expr in formulas.items():
+        if target in scenario_targets:
+            scenario_formulas[target] = expr
+        else:
+            row_formulas[target] = expr
+    
+    # Step 6: Split row formulas into Phase 1 and Phase 3
+    phase1_row_formulas = {}
+    phase3_row_formulas = {}
+    
+    for target, expr in row_formulas.items():
+        deps = extract_identifiers(expr)
+        if any(dep in scenario_targets for dep in deps):
+            phase3_row_formulas[target] = expr
+        else:
+            phase1_row_formulas[target] = expr
+    
+    print(f"[INFO] Row-level formulas ({len(row_formulas)}): {list(row_formulas.keys())}")
+    print(f"[INFO] Scenario-level formulas ({len(scenario_formulas)}): {list(scenario_formulas.keys())}")
+    print(f"[INFO] Phase 1 row formulas ({len(phase1_row_formulas)}): {list(phase1_row_formulas.keys())}")
+    print(f"[INFO] Phase 3 row formulas ({len(phase3_row_formulas)}): {list(phase3_row_formulas.keys())}")
+    
+    # Build execution orders
+    phase1_order = topo_sort({t: {d for d in extract_identifiers(e) if d in phase1_row_formulas} 
+                              for t, e in phase1_row_formulas.items()}) if phase1_row_formulas else []
+    phase3_order = topo_sort({t: {d for d in extract_identifiers(e) if d in phase3_row_formulas} 
+                              for t, e in phase3_row_formulas.items()}) if phase3_row_formulas else []
+    scenario_order = topo_sort({t: {d for d in extract_identifiers(e) if d in scenario_targets} 
+                                for t, e in scenario_formulas.items()}) if scenario_formulas else list(scenario_formulas.keys())
+    
+    print("Phase 1 row-level execution order:", phase1_order)
+    print("Phase 3 row-level execution order:", phase3_order)
+    print("Scenario-level execution order:", scenario_order)
+    
+    # Initialize results storage
+    computed_rows = []
+    errors = []
+    
+    if scenario_formulas:
+        # SCENARIO MODE: Three-phase execution
+        print("[INFO] SCENARIO MODE ENABLED: Executing in three phases")
+        
+        # PHASE 1: Row-level execution (per product)
+        print("[PHASE 1] Executing Phase 1 row formulas...")
+        for i, row in enumerate(all_rows):
+            row_copy = row.copy()
+            values = {}
+            
+            for target in phase1_order:
+                try:
+                    val = run_formula(phase1_row_formulas[target], row_copy, all_rows=all_rows)
+                    
+                    if val is None:
+                        print(f"[SKIP] ID={row_ids[i]} {target} = None (skipped)")
+                        continue
+                        
+                    row_copy[target] = val
+                    values[target] = val
+                except Exception as e:
+                    error_msg = f"Formula error: {e}"
+                    errors.append((row_ids[i], target, error_msg))
+                    print(f"[ERROR] ID={row_ids[i]} {target}: {error_msg}")
+            
+            computed_rows.append(row_copy)
+            
+            if values:
+                print(f"[PREVIEW] ID={row_ids[i]} -> " + ", ".join(f"{k}={v}" for k, v in values.items()))
+        
+        # PHASE 2: Scenario-level execution (once)
+        print("[PHASE 2] Executing scenario-level formulas...")
+        
+        # Build scenario context
+        scenario_context = {}
+        all_scenario_vars = set()
+        for expr in scenario_formulas.values():
+            all_scenario_vars |= extract_identifiers(expr)
+        
+        SCALAR_V
