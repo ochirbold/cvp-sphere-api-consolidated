@@ -753,6 +753,26 @@ def classify_and_execute_formulas(
     
     # CVP-specific: F (fixed cost) is a scalar input
     SCALAR_INPUTS = {'F'}
+    LP_RUNTIME_SCENARIO_VARS = {'r0', 'optimal_r', 'optimal_value', 'lp_status'}
+    LP_RUNTIME_ROW_VARS = {'X0_J', 'X0_j', 'x0_j'}
+
+    def is_runtime_passthrough_formula(target: str, expr: str) -> bool:
+        """Treat LP-generated values as passthrough targets instead of self-cycles."""
+        normalized_target = target.strip().upper()
+        normalized_expr = expr.strip()
+
+        if normalized_target == 'X0_J' and normalized_expr.upper() == 'X0_J':
+            return True
+        if normalized_target == 'R0' and normalized_expr == 'r0':
+            return True
+        return False
+
+    def graph_deps(target: str, expr: str, eligible_targets: Set[str]) -> Set[str]:
+        """Return only true formula dependencies for topological sorting."""
+        deps = {d for d in extract_identifiers(expr) if d in eligible_targets}
+        if is_runtime_passthrough_formula(target, expr):
+            deps.discard(target)
+        return deps
     
     # Step 1: Identify DSL constructs and scenario-level formulas
     scenario_targets = set()
@@ -778,6 +798,7 @@ def classify_and_execute_formulas(
         deps = extract_identifiers(expr)
         row_refs = deps & all_input_vars
         row_refs -= SCALAR_INPUTS
+        row_refs -= LP_RUNTIME_SCENARIO_VARS
         return len(row_refs) > 0
     
     # Step 4: Expand scenario targets based on dependencies
@@ -813,7 +834,15 @@ def classify_and_execute_formulas(
     
     for target, expr in row_formulas.items():
         deps = extract_identifiers(expr)
-        if any(dep in scenario_targets for dep in deps):
+        if (
+            is_runtime_passthrough_formula(target, expr)
+            or any(
+                dep in scenario_targets
+                or dep in LP_RUNTIME_SCENARIO_VARS
+                or dep in LP_RUNTIME_ROW_VARS
+                for dep in deps
+            )
+        ):
             phase3_row_formulas[target] = expr
         else:
             phase1_row_formulas[target] = expr
@@ -826,11 +855,11 @@ def classify_and_execute_formulas(
         print(f"[INFO] DSL constructs: {list(dsl_targets)}")
     
     # Build execution orders
-    phase1_order = topo_sort({t: {d for d in extract_identifiers(e) if d in phase1_row_formulas} 
+    phase1_order = topo_sort({t: graph_deps(t, e, set(phase1_row_formulas)) 
                               for t, e in phase1_row_formulas.items()}) if phase1_row_formulas else []
-    phase3_order = topo_sort({t: {d for d in extract_identifiers(e) if d in phase3_row_formulas} 
+    phase3_order = topo_sort({t: graph_deps(t, e, set(phase3_row_formulas)) 
                               for t, e in phase3_row_formulas.items()}) if phase3_row_formulas else []
-    scenario_order = topo_sort({t: {d for d in extract_identifiers(e) if d in scenario_targets} 
+    scenario_order = topo_sort({t: graph_deps(t, e, set(scenario_targets)) 
                                 for t, e in scenario_formulas.items()}) if scenario_formulas else list(scenario_formulas.keys())
     
     print("Phase 1 row-level execution order:", phase1_order)
