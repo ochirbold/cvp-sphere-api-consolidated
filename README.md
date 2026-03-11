@@ -5,15 +5,16 @@ FastAPI дээр ажилладаг CVP optimization болон formula executio
 ## Одоогийн боломжууд
 
 - `POST /optimize` endpoint нь `volume`, `price`, `cost`, `robust` case-уудыг дэмжинэ.
-- `volume` optimizer нь шинэ DSL + LP pipeline ашиглахыг оролдоно, боломжгүй үед legacy `scipy.optimize.linprog` fallback руу орно.
-- `volume` хариуд `safeRange`-аас гадна Sheet2-тэй таарах `projectedRange` буцаадаг.
-- `POST /formula/calculate` endpoint нь `formula.pythoncode` shim-ээр дамжин `formula/core/orchestrator.py`-г ажиллуулна.
+- `POST /formula/calculate` нь indicator-driven formula engine-ийн canonical endpoint.
+- `POST /formula/calculate` одоогоор зөвхөн `mode="indicator_current"`-ийг дэмжинэ; optimizer-only mode-ууд retired болсон.
+- `POST /formula/optimize` endpoint нь шинэ optimize engine биш, `indicator_current` руу forward хийдэг compatibility alias.
+- Formula engine нь Oracle DB-ээс DSL уншиж, LP solve шаардлагатай үед `scipy.optimize.linprog` ашигладаг.
 - `POST /formula/calculate/direct` endpoint одоогоор placeholder; бодит direct execution хараахан бүрэн хийгдээгүй.
 
 ## Төслийн бүтэц
 
 - `main.py`: FastAPI entrypoint
-- `formula/core/volume_optimizer.py`: volume optimization service
+- `formula/core/volume_optimizer.py`: legacy volume optimization logic
 - `formula/core/orchestrator.py`: Oracle DB-тэй formula execution engine
 - `formula/pythoncode.py`: backward-compatible shim
 - `formula/tests/`: optimizer болон DSL regression тестүүд
@@ -121,20 +122,58 @@ Precheck амжилтгүй бол `NO_SAFE_REGION` статус буцна.
 
 ### `POST /formula/calculate`
 
-Энэ endpoint нь subprocess-оор `python -m formula.pythoncode` ажиллуулж, DB дээрх formula execution-г trigger хийнэ.
+Энэ endpoint нь subprocess-оор `python -m formula.pythoncode` ажиллуулж, DB дээрх indicator formula execution-г trigger хийнэ.
+
+Хамгийн түгээмэл request:
 
 ```bash
 curl -X POST "http://localhost:8000/formula/calculate" \
   -H "Content-Type: application/json" \
   -d '{
-    "indicator_id": 17687947217601,
+    "indicator_id": 232819585,
     "id_column": "ID",
-    "formulas": [
-      "CM_J:P_J - C_J",
-      "X0_J:(X_MIN_J + X_MAX_J) / 2"
-    ]
+    "mode": "indicator_current",
+    "persist": true
   }'
 ```
+
+`mode`-ийг өгөхгүй орхивол мөн `indicator_current` behavior руу орно.
+
+Request-level solver override ашиглаж болно:
+
+```json
+{
+  "indicator_id": 232819585,
+  "id_column": "ID",
+  "mode": "indicator_current",
+  "persist": true,
+  "solver": {
+    "method": "revised simplex"
+  }
+}
+```
+
+Дэмжигдэх `solver.method` утгууд:
+
+- `highs`
+- `highs-ds`
+- `highs-ipm`
+- `simplex`
+- `revised simplex`
+
+Тэмдэглэл:
+
+- `highs` бол default ба production-д хамгийн аюулгүй сонголт.
+- `revised simplex` нь олон optimal center-тэй LP дээр seminar / hand-built script-тэй ижил vertex сонгох тохиолдол байдаг.
+- Solver method өөрчлөгдөхөд ихэнхдээ `r` ижил хэвээр үлдэж, `x` center өөр сонгогдож болно.
+
+### `POST /formula/optimize`
+
+Энэ endpoint одоо compatibility alias.
+
+- `POST /formula/calculate` руу forward хийнэ
+- зөвхөн `mode="indicator_current"`-ийг зөвшөөрнө
+- шинэ optimizer-only API гэж үзэхгүй байх нь зөв
 
 ### `POST /formula/calculate/direct`
 
@@ -162,6 +201,62 @@ python -m formula.pythoncode VT_DATA.V_17687947217601 ID "CM_J:P_J - C_J" "X0_J:
 ```
 
 Жинхэнэ хэрэгжилт нь `formula/core/orchestrator.py` дотор байрлаж байгаа.
+
+## DSL тэмдэглэл
+
+### `DECISION(x)` auto-size
+
+Одоо vector decision variable-ийн хэмжээг гараар тогтоохгүй байж болно.
+
+Өмнөх хэлбэр:
+
+```text
+DECISION_X  DECISION(x, size=3)
+```
+
+Шинэ зөвлөмжит хэлбэр:
+
+```text
+DECISION_X  DECISION(x)
+```
+
+Engine нь тухайн indicator-ийн fetch хийсэн мөрийн тоогоор `x1..xN`-ийг автоматаар resolve хийнэ.
+
+Дэмжигдэх хэлбэрүүд:
+
+- `DECISION(x)`
+- `DECISION(x, size=3)`
+- `DECISION(x, size=AUTO)`
+
+### `X0_J` ба `R0`-г DB-д хадгалах
+
+Хэрэв LP solve-ийн center болон radius-ийг шууд DB баганад хадгалах шаардлагатай бол DSL дээр target болгож өгч болно:
+
+```text
+CM_J            P_J - C_J
+X0_J            X0_J
+R0              r0
+CM_NORM         NORM(vector(CM_J))
+SAFE_X_MIN      X0_J - r0*(CM_J/CM_NORM)
+SAFE_X_MAX      X0_J + r0*(CM_J/CM_NORM)
+DECISION_X      DECISION(x)
+DECISION_R      DECISION(r)
+OBJ             OBJECTIVE(1*r)
+BOUND_X         BOUND(x,XMIN,XMAX)
+BOUND_R         BOUND(r,0,None)
+CONSTRAINT_LP   -DOT(vector(CM_J),x)+NORM(vector(CM_J))*r<=-F
+```
+
+Энд:
+
+- `X0_J  X0_J` нь LP propagation-аар мөр бүрт үүссэн харгалзах `x` утгыг DB target column руу бичнэ.
+- `R0    r0` нь scenario-level solve-оос гарсан radius-ийг DB target column руу бичнэ.
+
+Анхаарах зүйл:
+
+- `X0_J = X0_J` гэж `=` давхар бичихгүй.
+- `R0` target-ийн expression нь `R0` биш, жижиг `r0` байна.
+- DB дээр `X0_J`, `R0` гэсэн writable column заавал байх ёстой.
 
 ## Тест ажиллуулах
 
@@ -201,5 +296,6 @@ docker run -p 8000:8000 --env-file formula/.env cvp-sphere-api
 
 - `formula/.env` файлд жинхэнэ credential хадгалж байгаа бол repository руу commit хийж болохгүй.
 - `POST /formula/calculate/direct` бүрэн хийгдээгүй.
+- `POST /formula/calculate` болон `POST /formula/optimize` дээр optimizer-only mode-уудыг ашиглахгүй; одоогийн дэмжигдэх mode нь `indicator_current`.
 - README дээрх хуучин `PYTHONCODE.py` том үсэгтэй нэршлийг шинэчилсэн; одоо canonical entry нь `python -m formula.pythoncode`.
 - Railway болон deployment нэмэлт тэмдэглэлүүдийг root README-д биш, тусдаа deployment doc дээр хадгалах нь илүү зөв.
