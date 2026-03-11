@@ -23,6 +23,7 @@ Refactored version with improvements:
 """
 
 import sys
+import json
 import oracledb
 from collections import defaultdict
 from dotenv import load_dotenv
@@ -59,6 +60,37 @@ except ImportError:
 
 # Load environment variables from .env file
 load_dotenv()
+
+VALID_LP_METHODS = {
+    "highs",
+    "highs-ds",
+    "highs-ipm",
+    "simplex",
+    "revised simplex",
+}
+
+
+def get_lp_solver_config() -> Tuple[str, Dict[str, Any]]:
+    """Read LP solver configuration from environment variables."""
+    method = os.environ.get("CVP_LP_METHOD", "highs").strip()
+    if method not in VALID_LP_METHODS:
+        raise ValueError(
+            f"Unsupported LP solver method: {method}. Supported: {sorted(VALID_LP_METHODS)}"
+        )
+
+    options_raw = os.environ.get("CVP_LP_OPTIONS_JSON")
+    options: Dict[str, Any] = {}
+    if options_raw:
+        try:
+            parsed = json.loads(options_raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid CVP_LP_OPTIONS_JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("CVP_LP_OPTIONS_JSON must decode to an object")
+        options = parsed
+
+    return method, options
+
 
 
 # ============================================================================
@@ -354,6 +386,11 @@ def generate_cache_key(scenario_context: Dict[str, Any], lp_matrices: Dict[str, 
                 else:
                     key_parts.append(f"{key}:{len(value)}:{value[0]:.6f}")
     
+    solver_method = os.environ.get("CVP_LP_METHOD", "highs").strip()
+    solver_options_raw = os.environ.get("CVP_LP_OPTIONS_JSON", "")
+    key_parts.append(f"solver_method:{solver_method}")
+    key_parts.append(f"solver_options:{solver_options_raw}")
+
     # Include LP matrix dimensions
     key_parts.append(f"c:{len(lp_matrices.get('c', []))}")
     if 'A_ub' in lp_matrices and lp_matrices['A_ub']:
@@ -594,7 +631,11 @@ def execute_lp_optimization(
         else:
             # Solve LP problem
             print("[LP] Solving LP problem...")
-            solver = LPSolver()
+            solver_method, solver_options = get_lp_solver_config()
+            print(f"[LP] Solver method: {solver_method}")
+            if solver_options:
+                print(f"[LP] Solver options: {solver_options}")
+            solver = LPSolver(method=solver_method, options=solver_options)
             result = solver.solve_from_matrices(lp_matrices, maximize=True)
             
             # Cache the result
@@ -835,6 +876,8 @@ def classify_and_execute_formulas(
         
         # Build scenario context
         scenario_context = {}
+        scenario_context['ROW_COUNT'] = len(all_rows)
+        print(f"[SCENARIO] ROW_COUNT = {len(all_rows)}")
         all_scenario_vars = set()
         for expr in scenario_formulas.values():
             all_scenario_vars |= extract_identifiers(expr)
@@ -1209,6 +1252,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
 
 
 

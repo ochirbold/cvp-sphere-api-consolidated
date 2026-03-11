@@ -15,25 +15,17 @@ except Exception:
 
 app = FastAPI(title="CVP Optimization & Formula Engine API", version="2.0.0")
 
-# =====================================================
-# REQUEST MODELS
-# =====================================================
 
 class Product(BaseModel):
     itemName: str
     itemCode: str
-
-    # volume
     p: Optional[str] = None
     c: Optional[str] = None
     xmin: Optional[str] = None
     xmax: Optional[str] = None
-
-    # price / cost / robust
     avgVolume: Optional[str] = None
     avgPrice: Optional[str] = None
     cost: Optional[str] = None
-
     pmin: Optional[str] = None
     pmax: Optional[str] = None
     cmin: Optional[str] = None
@@ -46,22 +38,52 @@ class OptimizeRequest(BaseModel):
     products: List[Product]
 
 
+FormulaMode = Literal["indicator_current"]
+
+
+class SolverConfig(BaseModel):
+    method: Optional[str] = None
+    options: Optional[Dict[str, Any]] = None
+
+
+
 class FormulaRequest(BaseModel):
     indicator_id: int
     id_column: str = "ID"
-    formulas: Optional[List[str]] = None  # Optional manual formulas
+    formulas: Optional[List[str]] = None
+    mode: Optional[FormulaMode] = None
+    persist: Optional[bool] = None
+    solver: Optional[SolverConfig] = None
 
 
 class DirectFormulaRequest(BaseModel):
     table_name: str
     id_column: str
-    formulas: Dict[str, str]  # target: expression
-    data: List[Dict[str, Any]]  # Row data
+    formulas: Dict[str, str]
+    data: List[Dict[str, Any]]
 
 
-# =====================================================
-# UTIL
-# =====================================================
+class FormulaOptimizeRequest(BaseModel):
+    indicator_id: int
+    id_column: str = "ID"
+    formulas: Optional[List[str]] = None
+    mode: Optional[str] = None
+    persist: Optional[bool] = None
+    solver: Optional[SolverConfig] = None
+
+
+
+VALID_LP_METHODS = {
+    "highs",
+    "highs-ds",
+    "highs-ipm",
+    "simplex",
+    "revised simplex",
+}
+
+class FormulaRequestError(ValueError):
+    """Raised when the unified formula request is invalid."""
+
 
 def f(x, field):
     if x is None:
@@ -75,13 +97,9 @@ def no_safe_region(case, reason, details=None, suggestion=None):
         "case": case,
         "reason": reason,
         "details": details or {},
-        "suggestion": suggestion or "Adjust input parameters"
+        "suggestion": suggestion or "Adjust input parameters",
     }
 
-
-# =====================================================
-# PRE-CHECKS (BUSINESS + MATH)
-# =====================================================
 
 def precheck_volume(req):
     for p in req.products:
@@ -90,14 +108,14 @@ def precheck_volume(req):
                 "volume",
                 "Unit price is not greater than unit cost",
                 {"itemCode": p.itemCode},
-                "Increase price or reduce cost"
+                "Increase price or reduce cost",
             )
         if f(p.xmin, "xmin") > f(p.xmax, "xmax"):
             return no_safe_region(
                 "volume",
                 "xmin is greater than xmax",
                 {"itemCode": p.itemCode},
-                "Fix volume bounds"
+                "Fix volume bounds",
             )
     return None
 
@@ -112,7 +130,7 @@ def precheck_price(req):
             "price",
             "Even max price cannot cover fixed cost",
             {"maxRevenue": revenue, "totalCost": cost, "fixedCost": F},
-            "Increase volume or reduce fixed cost"
+            "Increase volume or reduce fixed cost",
         )
     return None
 
@@ -126,7 +144,7 @@ def precheck_cost(req):
             "cost",
             "Total revenue does not exceed fixed cost",
             {"totalRevenue": revenue, "fixedCost": F},
-            "Reduce fixed cost or increase price/volume"
+            "Reduce fixed cost or increase price/volume",
         )
     return None
 
@@ -141,14 +159,10 @@ def precheck_robust(req):
             "robust",
             "Worst-case scenario is not profitable",
             {"worstRevenue": worst_revenue, "worstCost": worst_cost, "fixedCost": F},
-            "Improve worst-case price or reduce worst-case cost"
+            "Improve worst-case price or reduce worst-case cost",
         )
     return None
 
-
-# =====================================================
-# SOLVERS (SAFE)
-# =====================================================
 
 def solve_volume(req):
     fail = precheck_volume(req)
@@ -168,6 +182,8 @@ def solve_volume(req):
     ]
 
     return optimize_volume(products, f(req.fixedCost, "fixedCost"))
+
+
 def solve_price(req):
     fail = precheck_price(req)
     if fail:
@@ -195,9 +211,7 @@ def solve_price(req):
             A.append(row)
             b.append(sign * bound)
 
-    res = linprog(c_obj, A_ub=A, b_ub=b,
-                  bounds=[(None, None)] * n + [(0, None)],
-                  method="highs")
+    res = linprog(c_obj, A_ub=A, b_ub=b, bounds=[(None, None)] * n + [(0, None)], method="highs")
 
     if not res.success or res.x is None or res.x[-1] <= 0:
         return no_safe_region("price", "No feasible safe price region")
@@ -213,13 +227,10 @@ def solve_price(req):
                 "itemName": req.products[i].itemName,
                 "itemCode": req.products[i].itemCode,
                 "priceCenter": float(p0[i]),
-                "safePriceRange": {
-                    "min": float(p0[i] - delta),
-                    "max": float(p0[i] + delta)
-                }
+                "safePriceRange": {"min": float(p0[i] - delta), "max": float(p0[i] + delta)},
             }
             for i in range(n)
-        ]
+        ],
     }
 
 
@@ -250,9 +261,7 @@ def solve_cost(req):
             A.append(row)
             b.append(sign * bound)
 
-    res = linprog(c_obj, A_ub=A, b_ub=b,
-                  bounds=[(None, None)] * n + [(0, None)],
-                  method="highs")
+    res = linprog(c_obj, A_ub=A, b_ub=b, bounds=[(None, None)] * n + [(0, None)], method="highs")
 
     if not res.success or res.x is None or res.x[-1] <= 0:
         return no_safe_region("cost", "No feasible safe cost region")
@@ -268,13 +277,10 @@ def solve_cost(req):
                 "itemName": req.products[i].itemName,
                 "itemCode": req.products[i].itemCode,
                 "costCenter": float(c0[i]),
-                "safeCostRange": {
-                    "min": float(c0[i] - delta),
-                    "max": float(c0[i] + delta)
-                }
+                "safeCostRange": {"min": float(c0[i] - delta), "max": float(c0[i] + delta)},
             }
             for i in range(n)
-        ]
+        ],
     }
 
 
@@ -287,99 +293,175 @@ def solve_robust(req):
         "status": "OK",
         "case": "robust",
         "message": "System is robustly profitable under all given ranges",
-        "products": [
-            {"itemName": p.itemName, "itemCode": p.itemCode}
-            for p in req.products
-        ]
+        "products": [{"itemName": p.itemName, "itemCode": p.itemCode} for p in req.products],
     }
 
 
-# =====================================================
-# CVP FORMULA ENGINE API ENDPOINTS
-# =====================================================
+def _normalize_solver_config(solver: Optional[SolverConfig]) -> Optional[Dict[str, Any]]:
+    if solver is None:
+        return None
+
+    normalized: Dict[str, Any] = {}
+    if solver.method is not None:
+        method = solver.method.strip()
+        if method not in VALID_LP_METHODS:
+            raise FormulaRequestError(
+                f"Unsupported solver method: {method}. Supported: {sorted(VALID_LP_METHODS)}"
+            )
+        normalized["method"] = method
+
+    if solver.options is not None:
+        if not isinstance(solver.options, dict):
+            raise FormulaRequestError("solver.options must be an object")
+        normalized["options"] = solver.options
+
+    return normalized or None
+
+
+def _run_formula_calculate_subprocess(request: FormulaRequest) -> Dict[str, Any]:
+    cmd = [sys.executable, "-m", "formula.pythoncode", str(request.indicator_id), request.id_column]
+    if request.formulas:
+        cmd.extend(request.formulas)
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    env = os.environ.copy()
+    solver_config = _normalize_solver_config(request.solver)
+    if solver_config is not None:
+        if "method" in solver_config:
+            env["CVP_LP_METHOD"] = solver_config["method"]
+        if "options" in solver_config:
+            env["CVP_LP_OPTIONS_JSON"] = json.dumps(solver_config["options"])
+
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=current_dir, env=env)
+
+    if result.returncode == 0:
+        lines = result.stdout.split("\n")
+        updated_rows = 0
+        errors = 0
+        for line in lines:
+            if "Updated rows:" in line:
+                updated_rows = int(line.split(":")[1].strip())
+            elif "Errors:" in line:
+                errors = int(line.split(":")[1].strip())
+        return {
+            "success": True,
+            "updated_rows": updated_rows,
+            "errors": errors,
+            "output": result.stdout,
+            "command": " ".join(cmd),
+            "solver": solver_config,
+        }
+
+    return {
+        "success": False,
+        "updated_rows": 0,
+        "errors": 1,
+        "error": result.stderr,
+        "output": result.stdout,
+        "command": " ".join(cmd),
+        "solver": solver_config,
+    }
+
+def _normalize_formula_mode(mode: Optional[str]) -> Optional[str]:
+    if mode is None:
+        return None
+    if mode == "indicator_current":
+        return mode
+    raise FormulaRequestError(
+        "Only mode='indicator_current' is supported. Optimizer-only modes were retired."
+    )
+
+
+def _resolve_persist(mode: Optional[str], persist: Optional[bool]) -> bool:
+    if persist is not None:
+        return persist
+    return True
+
+
+def _execute_formula_request(request: FormulaRequest) -> Dict[str, Any]:
+    mode = _normalize_formula_mode(request.mode)
+    persist = _resolve_persist(mode, request.persist)
+
+    if mode in (None, "indicator_current"):
+        legacy_result = _run_formula_calculate_subprocess(request)
+        if mode is None:
+            return legacy_result
+        return {
+            "success": legacy_result.get("success", False),
+            "mode": "indicator_current",
+            "persist": persist,
+            "solver": _normalize_solver_config(request.solver),
+            "indicator_id": request.indicator_id,
+            "id_column": request.id_column,
+            "execution": {
+                "path": "formula_engine",
+                "updated_rows": legacy_result.get("updated_rows", 0),
+                "errors": legacy_result.get("errors", 0),
+                "command": legacy_result.get("command"),
+            },
+            "result": legacy_result,
+        }
+
+    raise FormulaRequestError(f"Unsupported formula mode: {mode}")
+
 
 @app.post("/formula/calculate")
 async def calculate_formulas(request: FormulaRequest):
-    """
-    Execute CVP formulas for given indicator_id (subprocess wrapper)
-    """
+    """Unified formula endpoint for legacy calculate and indicator-current execution."""
     try:
-        # Build command
-        cmd = [sys.executable, "-m", "formula.pythoncode", str(request.indicator_id), request.id_column]
-        
-        # Add manual formulas if provided
-        if request.formulas:
-            cmd.extend(request.formulas)
-        
-        # Get current directory
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # Execute from current directory
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=current_dir
+        return _execute_formula_request(request)
+    except FormulaRequestError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/formula/optimize")
+async def optimize_formula_indicator(request: FormulaOptimizeRequest):
+    """Compatibility alias that now forwards only to indicator_current execution."""
+    try:
+        if request.mode not in (None, "indicator_current"):
+            raise FormulaRequestError(
+                "POST /formula/optimize no longer supports optimizer-only modes. "
+                "Use POST /formula/calculate with mode='indicator_current' or omit mode."
+            )
+        unified_request = FormulaRequest(
+            indicator_id=request.indicator_id,
+            id_column=request.id_column,
+            formulas=request.formulas,
+            mode="indicator_current",
+            persist=request.persist,
+            solver=request.solver,
         )
-        
-        # Parse output
-        if result.returncode == 0:
-            # Extract results from output
-            lines = result.stdout.split('\n')
-            updated_rows = 0
-            errors = 0
-            
-            for line in lines:
-                if "Updated rows:" in line:
-                    updated_rows = int(line.split(":")[1].strip())
-                elif "Errors:" in line:
-                    errors = int(line.split(":")[1].strip())
-            
-            return {
-                "success": True,
-                "updated_rows": updated_rows,
-                "errors": errors,
-                "output": result.stdout,
-                "command": " ".join(cmd)
-            }
-        else:
-            return {
-                "success": False,
-                "updated_rows": 0,
-                "errors": 1,
-                "error": result.stderr,
-                "output": result.stdout,
-                "command": " ".join(cmd)
-            }
-            
+        response = _execute_formula_request(unified_request)
+        if isinstance(response, dict):
+            response.setdefault(
+                "note",
+                "POST /formula/optimize is kept only as a compatibility alias for indicator_current.",
+            )
+        return response
+    except FormulaRequestError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/formula/calculate/direct")
 async def calculate_direct_formulas(request: DirectFormulaRequest):
-    """
-    Direct CVP calculation without database dependency
-    Note: This requires refactoring PYTHONCODE.PY to expose core functions
-    """
     try:
-        # For now, we'll use subprocess with a temporary file
         import tempfile
-        
-        # Create temporary data file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fobj:
             data = {
                 "table_name": request.table_name,
                 "id_column": request.id_column,
                 "formulas": request.formulas,
-                "data": request.data
+                "data": request.data,
             }
-            json.dump(data, f)
-            temp_file = f.name
-        
+            json.dump(data, fobj)
+            temp_file = fobj.name
+
         try:
-            # This would call a refactored version of the formula engine
-            # For now, return a placeholder response
             return {
                 "success": True,
                 "message": "Direct calculation endpoint - requires refactoring",
@@ -387,21 +469,18 @@ async def calculate_direct_formulas(request: DirectFormulaRequest):
                 "data_summary": {
                     "table": request.table_name,
                     "rows": len(request.data),
-                    "formulas": len(request.formulas)
-                }
+                    "formulas": len(request.formulas),
+                },
             }
         finally:
-            # Clean up temp file
             if os.path.exists(temp_file):
                 os.unlink(temp_file)
-                
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/formula/health")
 async def formula_health():
-    """Health check for formula engine"""
     return {
         "status": "healthy",
         "service": "CVP Formula Engine API",
@@ -409,24 +488,21 @@ async def formula_health():
         "endpoints": [
             "POST /formula/calculate",
             "POST /formula/calculate/direct",
-            "GET /formula/health"
-        ]
+            "POST /formula/optimize",
+            "GET /formula/health",
+        ],
+        "modes": ["indicator_current"],
     }
 
 
 @app.get("/health")
 async def health():
-    """Overall API health check"""
     return {
         "status": "healthy",
         "service": "CVP Optimization & Formula Engine API",
-        "version": "2.0.0"
+        "version": "2.0.0",
     }
 
-
-# =====================================================
-# OPTIMIZATION ENDPOINT (EXISTING)
-# =====================================================
 
 @app.post("/optimize")
 def optimize(req: OptimizeRequest):
@@ -438,13 +514,8 @@ def optimize(req: OptimizeRequest):
         return solve_cost(req)
     if req.case == "robust":
         return solve_robust(req)
-
     raise HTTPException(status_code=400, detail="Invalid case")
 
-
-# =====================================================
-# ROOT ENDPOINT
-# =====================================================
 
 @app.get("/")
 async def root():
@@ -454,28 +525,32 @@ async def root():
         "documentation": "/docs",
         "endpoints": {
             "optimization": {
-                "POST /optimize": "CVP optimization (volume, price, cost, robust)"
+                "POST /optimize": "CVP optimization (volume, price, cost, robust)",
             },
             "formula_engine": {
-                "POST /formula/calculate": "Execute CVP formulas from database",
+                "POST /formula/calculate": "Unified formula endpoint with legacy and indicator_current execution",
                 "POST /formula/calculate/direct": "Direct calculation with provided data",
-                "GET /formula/health": "Formula engine health check"
+                "POST /formula/optimize": "Compatibility alias for indicator_current",
+                "GET /formula/health": "Formula engine health check",
             },
             "system": {
                 "GET /health": "Overall API health",
-                "GET /": "This documentation"
-            }
-        }
+                "GET /": "This documentation",
+            },
+        },
     }
 
 
-# =====================================================
-# MAIN
-# =====================================================
-
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+
+
+
 
 
 

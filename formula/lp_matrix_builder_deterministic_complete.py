@@ -50,18 +50,40 @@ class LPMatrixBuilder:
         dsl_structures = lp_spec.get('dsl_structures', {})
         
         # Get decision variables
-        raw_variables = lp_spec.get('variables', [])
-        
-        # Add variables from DSL
+        raw_variables = list(lp_spec.get('variables', []))
+
+        # Add variables from DSL, resolving DECISION(x) against fetched row count when needed.
         if 'decision' in dsl_structures:
+            row_count = self.scenario_context.get('ROW_COUNT')
             for decision_info in dsl_structures['decision']:
                 var_name = decision_info.get('variable_name')
-                if var_name and var_name not in raw_variables:
+                vector_variables = list(decision_info.get('vector_variables', []))
+                declared_size = decision_info.get('size')
+                auto_size = bool(decision_info.get('auto_size'))
+
+                if auto_size and var_name == 'x':
+                    if row_count is None:
+                        raise ValueError("DECISION(x) requires ROW_COUNT in scenario context")
+                    resolved_size = int(row_count)
+                    if resolved_size <= 0:
+                        raise ValueError(f"ROW_COUNT must be positive, got {resolved_size}")
+                    vector_variables = [f"x{i+1}" for i in range(resolved_size)]
+                    print(f"[LP] Resolved DECISION(x) size from ROW_COUNT = {resolved_size}")
+                elif declared_size is not None:
+                    if row_count is not None and var_name == 'x' and int(row_count) != int(declared_size):
+                        print(f"[LP WARNING] DECISION(x, size={declared_size}) does not match ROW_COUNT={int(row_count)}")
+                    print(f"[LP] Using declared DECISION({var_name}, size={declared_size})")
+
+                for resolved_var in vector_variables:
+                    if resolved_var and resolved_var not in raw_variables:
+                        raw_variables.append(resolved_var)
+
+                if var_name and var_name not in raw_variables and not vector_variables:
                     raw_variables.append(var_name)
-        
+
         if not raw_variables:
             raise ValueError("No decision variables specified in LP specification")
-        
+
         # Sort variables deterministically
         x_vars = sorted([var for var in raw_variables if var.startswith('x')])
         r_vars = sorted([var for var in raw_variables if var == 'r'])
@@ -722,3 +744,4 @@ class LPMatrixBuilder:
                 continue
         
         return A_ub_rows, b_ub_values
+

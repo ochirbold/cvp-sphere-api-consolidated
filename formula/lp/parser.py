@@ -242,24 +242,26 @@ class LPModelParser:
         
         for target, expr in formulas.items():
             # Look for DECISION() calls with optional size parameter
-            decision_matches = re.findall(r'DECISION\s*\(\s*([^,)]+)(?:\s*,\s*size\s*=\s*(\d+))?\s*\)', expr, re.IGNORECASE)
+            decision_matches = re.findall(r'DECISION\s*\(\s*([^,)]+?)(?:\s*,\s*size\s*=\s*([A-Za-z0-9_]+))?\s*\)', expr, re.IGNORECASE)
             for match in decision_matches:
                 var_name = match[0].strip()
-                size_str = match[1].strip() if match[1] else None
-                size = int(size_str) if size_str and size_str.isdigit() else None
+                size_token = match[1].strip() if match[1] else None
+                size = int(size_token) if size_token and size_token.isdigit() else None
+                auto_size = size_token is None or (isinstance(size_token, str) and size_token.upper() == "AUTO")
                 
-                # Generate vector variable names if size is specified
+                # Generate vector variable names if size is specified or auto-resolved later
                 vector_variables = []
                 if size and size > 1:
                     vector_variables = [f"{var_name}{i+1}" for i in range(size)]
+                elif auto_size and var_name == "x":
+                    vector_variables = []
                 else:
-                    # Scalar variable
                     vector_variables = [var_name]
-                
                 dsl_structures['decision'].append({
                     'variable_name': var_name,
                     'size': size,
                     'vector_variables': vector_variables,
+                    'auto_size': auto_size,
                     'formula': target
                 })
             

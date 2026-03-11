@@ -163,7 +163,7 @@ class LPSolver:
                     A_eq=A_eq_list,
                     b_eq=b_eq_list,
                     bounds=bounds,
-                    method="highs",  # Explicitly set method for stability
+                    method=self.method,
                     options=self.options
                 )
             except Exception as e:
@@ -613,3 +613,5 @@ class NumericalError(LPSolverError):
 
 
 # =
+
+
