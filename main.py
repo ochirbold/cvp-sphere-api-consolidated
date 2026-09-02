@@ -1,5 +1,14 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+try:
+    from pydantic import BaseModel, model_validator
+
+    def scenario_code_alias_validator():
+        return model_validator(mode="before")
+except ImportError:
+    from pydantic import BaseModel, root_validator
+
+    def scenario_code_alias_validator():
+        return root_validator(pre=True)
 from typing import List, Optional, Literal, Dict, Any
 import numpy as np
 from scipy.optimize import linprog
@@ -54,6 +63,16 @@ class FormulaRequest(BaseModel):
     mode: Optional[FormulaMode] = None
     persist: Optional[bool] = None
     solver: Optional[SolverConfig] = None
+    scenario_code: Optional[str] = None
+
+    @scenario_code_alias_validator()
+    def normalize_scenario_code_alias(cls, values):
+        if isinstance(values, dict) and "scenario_code" not in values:
+            for alias in ("scenario_Code", "scenarioCode"):
+                if alias in values:
+                    values["scenario_code"] = values[alias]
+                    break
+        return values
 
 
 class DirectFormulaRequest(BaseModel):
@@ -70,6 +89,16 @@ class FormulaOptimizeRequest(BaseModel):
     mode: Optional[str] = None
     persist: Optional[bool] = None
     solver: Optional[SolverConfig] = None
+    scenario_code: Optional[str] = None
+
+    @scenario_code_alias_validator()
+    def normalize_scenario_code_alias(cls, values):
+        if isinstance(values, dict) and "scenario_code" not in values:
+            for alias in ("scenario_Code", "scenarioCode"):
+                if alias in values:
+                    values["scenario_code"] = values[alias]
+                    break
+        return values
 
 
 
@@ -331,6 +360,8 @@ def _run_formula_calculate_subprocess(request: FormulaRequest) -> Dict[str, Any]
             env["CVP_LP_METHOD"] = solver_config["method"]
         if "options" in solver_config:
             env["CVP_LP_OPTIONS_JSON"] = json.dumps(solver_config["options"])
+    if request.scenario_code is not None:
+        env["CVP_SCENARIO_CODE"] = request.scenario_code
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=current_dir, env=env)
 
@@ -393,6 +424,7 @@ def _execute_formula_request(request: FormulaRequest) -> Dict[str, Any]:
             "solver": _normalize_solver_config(request.solver),
             "indicator_id": request.indicator_id,
             "id_column": request.id_column,
+            "scenario_code": request.scenario_code,
             "execution": {
                 "path": "formula_engine",
                 "updated_rows": legacy_result.get("updated_rows", 0),
@@ -432,6 +464,7 @@ async def optimize_formula_indicator(request: FormulaOptimizeRequest):
             mode="indicator_current",
             persist=request.persist,
             solver=request.solver,
+            scenario_code=request.scenario_code,
         )
         response = _execute_formula_request(unified_request)
         if isinstance(response, dict):

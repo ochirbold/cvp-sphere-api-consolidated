@@ -102,6 +102,44 @@ def q(name: str) -> str:
     parts = name.split(".")
     return ".".join(f'"{p}"' for p in parts)
 
+def _clean_identifier(name: str) -> str:
+    return name.strip().strip('"')
+
+
+def _split_qualified_table_name(table_name: str) -> Tuple[Optional[str], str]:
+    parts = [_clean_identifier(part) for part in table_name.split(".")]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return None, parts[-1]
+
+
+def get_requested_scenario_code() -> Optional[str]:
+    value = os.environ.get("CVP_SCENARIO_CODE")
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def table_has_column(cur: Any, table_name: str, column_name: str) -> bool:
+    owner, object_name = _split_qualified_table_name(table_name)
+    params = {"table_name": object_name.upper(), "column_name": column_name.upper()}
+    if owner:
+        query = (
+            "SELECT 1 FROM ALL_TAB_COLUMNS "
+            "WHERE OWNER = :owner AND TABLE_NAME = :table_name "
+            "AND COLUMN_NAME = :column_name AND ROWNUM = 1"
+        )
+        params["owner"] = owner.upper()
+    else:
+        query = (
+            "SELECT 1 FROM ALL_TAB_COLUMNS "
+            "WHERE TABLE_NAME = :table_name "
+            "AND COLUMN_NAME = :column_name AND ROWNUM = 1"
+        )
+    cur.execute(query, params)
+    return cur.fetchone() is not None
+
 
 def parse_column_mapping(mapping_str: str) -> Dict[str, str]:
     """
@@ -1103,6 +1141,9 @@ def main() -> None:
     # Parse arguments
     table_or_id = sys.argv[1]
     id_column = sys.argv[2]
+    scenario_code = get_requested_scenario_code()
+    if scenario_code is not None:
+        print(f"[INFO] Scenario filter requested: SCENARIO_CODE = {scenario_code}")
     
     # Determine mode
     formulas = {}
@@ -1175,11 +1216,30 @@ def main() -> None:
         if id_column not in columns_to_fetch:
             columns_to_fetch.append(id_column)
         
+        scenario_filter_enabled = False
+        if scenario_code is not None:
+            if not table_has_column(cur, table_name, "SCENARIO_CODE"):
+                raise ValueError(
+                    f"scenario_code filter was requested, but {table_name} "
+                    "does not have a SCENARIO_CODE column"
+                )
+            scenario_filter_enabled = True
+            if "SCENARIO_CODE" not in columns_to_fetch:
+                columns_to_fetch.append("SCENARIO_CODE")
+
         quoted_columns = [q(col) for col in columns_to_fetch]
-        query = f"SELECT {', '.join(quoted_columns)} FROM {q(table_name)} ORDER BY {q(id_column)}"
+        query = f"SELECT {', '.join(quoted_columns)} FROM {q(table_name)}"
+        query_params = {}
+        if scenario_filter_enabled:
+            query += f" WHERE {q('SCENARIO_CODE')} = :scenario_code"
+            query_params["scenario_code"] = scenario_code
+        query += f" ORDER BY {q(id_column)}"
         
         print(f"[INFO] Query: {query}")
-        cur.execute(query)
+        if query_params:
+            cur.execute(query, query_params)
+        else:
+            cur.execute(query)
         
         # Fetch all rows
         rows = []
@@ -1252,12 +1312,16 @@ def main() -> None:
                             SET {q(target)} = :value
                             WHERE {q(id_column)} = :row_id
                         """
+                        update_params = {
+                            "value": value,
+                            "row_id": row_id,
+                        }
+                        if scenario_filter_enabled:
+                            update_query += f" AND {q('SCENARIO_CODE')} = :scenario_code"
+                            update_params["scenario_code"] = scenario_code
                         
                         try:
-                            update_cur.execute(update_query, {
-                                "value": value,
-                                "row_id": row_id
-                            })
+                            update_cur.execute(update_query, update_params)
                             updated_rows += 1
                         except Exception as e:
                             update_errors += 1
